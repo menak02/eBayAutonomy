@@ -8,20 +8,23 @@ from email.mime.text import MIMEText
 from dotenv import load_dotenv
 import openai
 import json
+import re
 import argparse
 
 # Load environment variables
 load_dotenv()
 
 CLIENT_ID = os.getenv("EBAY_CLIENT_ID")
+CLIENT_ID = os.getenv("EBAY_CLIENT_ID")
 CLIENT_SECRET = os.getenv("EBAY_CLIENT_SECRET")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+LLM_MODEL_NAME = os.getenv("LLM_MODEL_NAME", "gemini-3.5-flash")
 
 # Set up OpenAI client (OpenCode API key should work seamlessly with the OpenAI package)
-# Using OpenCode's Zen gateway API URL
+# Using OpenCode's Go gateway API URL
 client = openai.OpenAI(
     api_key=OPENAI_API_KEY,
-    base_url="https://opencode.ai/zen/v1"
+    base_url="https://opencode.ai/zen/go/v1"
 )
 
 # Parse command line arguments
@@ -137,7 +140,11 @@ def send_alerts(subject, body):
             print("Telegram enabled but TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID is missing in .env")
 
 def evaluate_deal_with_llm(listing_data):
-    """Uses OpenCode (via OpenAI package) to evaluate the deal and return a score."""
+    """Uses OpenCode (via OpenAI package) to evaluate the deal (multimodal)."""
+    
+    # Truncate description to prevent token bloat
+    description = listing_data.get('description', '')[:2500]
+    
     prompt = f"""
     Evaluate this eBay listing:
     - Title: {listing_data['title']}
@@ -147,24 +154,38 @@ def evaluate_deal_with_llm(listing_data):
     - Seller Positive Rating: {listing_data['seller_rating_pct']}%
     - Returns Accepted: {listing_data['returns_accepted']}
     
+    Description Snippet:
+    {description}
+    
     Task:
-    1. Is this listing the actual main item queried ({SEARCH_QUERY}), or is it just an accessory, replacement part, packaging/box, or manual? If it is an accessory or packaging (e.g., a case, bag, box, charger, or strap instead of the product itself), you MUST assign a FINAL_SCORE of 1.
-    2. Does it match the specific model/version requested in "{SEARCH_QUERY}"? If it is a different model/spec (e.g., an Intel model when they searched for M1, or a different brand), evaluate it normally as a deal but deduct points for not matching the target specifications.
+    1. Is this listing the actual main item queried ({SEARCH_QUERY}), or is it just an accessory, replacement part, packaging/box, or manual? If it is an accessory or packaging, you MUST assign a FINAL_SCORE of 1.
+    2. Does it match the specific model/version requested? Deduct points for mismatch.
     3. Is this price significantly below market average for the product described?
-    4. Is the seller trustworthy enough to warrant buying this deal?
-    5. Are there any hidden red flags based on the title or metrics?
-    6. Give a final Deal Score from 1-10. Deduct points if the seller has low feedback (<50 reviews) even if their percentage is 100%, or if they do not accept returns.
+    4. Are there any physical defects visible in the images (stains, cracks, dents, heavy wear) that contradict the condition or make this a bad deal?
+    5. Are there any hidden red flags in the title, description, or seller metrics?
+    6. Give a final Deal Score from 1-10. Deduct points if the seller has low feedback (<50 reviews), if returns are not accepted, or if the images show undisclosed damage.
     {EXTRA_PROMPT}
     
     Please provide your reasoning and end with exactly: "FINAL_SCORE: X" where X is the number (1-10).
     """
 
+    # Build multimodal message content
+    content_blocks = [{"type": "text", "text": prompt}]
+    
+    # Add images if available AND model supports vision (DeepSeek does not)
+    if "deepseek" not in LLM_MODEL_NAME.lower():
+        for img_url in listing_data.get("images", []):
+            content_blocks.append({
+                "type": "image_url",
+                "image_url": {"url": img_url}
+            })
+
     try:
         response = client.chat.completions.create(
-            model="deepseek-v4-flash-free",
+            model=LLM_MODEL_NAME,
             messages=[
                 {"role": "system", "content": "You are an expert deal finder and scam detector for eBay electronics."},
-                {"role": "user", "content": prompt}
+                {"role": "user", "content": content_blocks}
             ],
             temperature=0.3
         )
@@ -218,7 +239,7 @@ def generate_negative_keywords(query, category_name):
     """
     try:
         response = client.chat.completions.create(
-            model="deepseek-v4-flash-free",
+            model=LLM_MODEL_NAME,
             messages=[{"role": "user", "content": prompt}],
             temperature=0.1
         )
@@ -233,6 +254,42 @@ def generate_negative_keywords(query, category_name):
     except Exception as e:
         print(f"Failed to generate dynamic filters: {e}")
         return []
+
+def get_item_details(token, item_id):
+    """Fetches full description and image URLs for an item."""
+    url = f"https://api.ebay.com/buy/browse/v1/item/{requests.utils.quote(item_id)}"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "X-EBAY-C-MARKETPLACE-ID": "EBAY_US",
+        "Accept": "application/json"
+    }
+    try:
+        res = requests.get(url, headers=headers)
+        if res.status_code == 200:
+            data = res.json()
+            
+            # Combine condition description and main description
+            cond_desc = data.get("conditionDescription", "")
+            main_desc = data.get("description", "")
+            full_desc = f"{cond_desc}\n{main_desc}"
+            
+            # Strip HTML tags
+            clean_desc = re.sub('<[^<]+>', '', full_desc).strip()
+            
+            # Extract images (up to 4 total to save tokens)
+            images = []
+            if data.get("image", {}).get("imageUrl"):
+                images.append(data["image"]["imageUrl"])
+            
+            for img in data.get("additionalImages", [])[:3]:
+                if img.get("imageUrl"):
+                    images.append(img["imageUrl"])
+                    
+            return clean_desc, images
+    except Exception as e:
+        print(f"Failed to fetch item details: {e}")
+        
+    return "", []
 
 def search_ebay_deals(token, exclusions=None):
     """Searches eBay for new listings matching our criteria."""
@@ -316,7 +373,7 @@ def search_ebay_deals(token, exclusions=None):
         if any(trap in lower_title for trap in traps):
             continue
             
-        # Compile data for LLM
+        # Compile data for LLM (Basic)
         listing_data = {
             "title": title,
             "total_cost": total_cost,
@@ -326,6 +383,12 @@ def search_ebay_deals(token, exclusions=None):
             "returns_accepted": returns_accepted,
             "url": item.get("itemWebUrl")
         }
+        
+        # Fetch deep details (Description + Images) since it passed hard filters
+        print(f"Fetching full description & images for: {title}")
+        desc, images = get_item_details(token, item_id)
+        listing_data["description"] = desc
+        listing_data["images"] = images
         
         print(f"Evaluating: {title} | Total: ${total_cost:.2f}")
         score, explanation = evaluate_deal_with_llm(listing_data)
