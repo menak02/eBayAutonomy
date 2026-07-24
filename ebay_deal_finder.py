@@ -28,12 +28,14 @@ client = openai.OpenAI(
 parser = argparse.ArgumentParser(description="eBay Deal Finder Daemon")
 parser.add_argument("query", nargs='?', default="MacBook Pro M3", help="Search query")
 parser.add_argument("--max-price", type=float, help="Maximum price (USD)")
+parser.add_argument("--category-id", type=str, help="eBay Category ID (e.g. 177 for Laptops)")
 parser.add_argument("--extra-prompt", type=str, default="", help="Extra instructions for the LLM")
 parser.add_argument("--once", action="store_true", help="Run only once and exit")
 args = parser.parse_args()
 
 SEARCH_QUERY = args.query
 MAX_PRICE = args.max_price
+CATEGORY_ID = args.category_id
 EXTRA_PROMPT = args.extra_prompt
 RUN_ONCE = args.once
 
@@ -148,14 +150,25 @@ def search_ebay_deals(token):
     if MAX_PRICE:
         filters += f",price:[0..{MAX_PRICE}],priceCurrency:USD"
     
+    # Exclude common accessories directly in the query (negative keyword search)
+    exclusions = ["case", "cover", "sleeve", "bag", "box", "charger", "parts", "accessory", "compatible", "protector"]
+    exclude_str = " ".join([f"-{word}" for word in exclusions])
+    full_query = f"{SEARCH_QUERY} {exclude_str}"
+
     params = {
-        "q": SEARCH_QUERY,
+        "q": full_query,
         "sort": "newlyListed",
         "filter": filters,
         "limit": "20"
     }
 
-    print(f"Searching eBay Sandbox for '{SEARCH_QUERY}'...")
+    if CATEGORY_ID:
+        params["category_ids"] = CATEGORY_ID
+
+    print(f"Searching eBay Live API for '{SEARCH_QUERY}' (excl. accessories)...")
+    if CATEGORY_ID:
+        print(f"Restricted to Category: {CATEGORY_ID}")
+        
     res = requests.get("https://api.ebay.com/buy/browse/v1/item_summary/search", headers=search_headers, params=params)
     
     if res.status_code != 200:
@@ -237,6 +250,8 @@ def main():
     print(f"Starting eBay Deal Finder Daemon for '{SEARCH_QUERY}'...")
     if MAX_PRICE:
         print(f"Max Price Filter: ${MAX_PRICE}")
+    if CATEGORY_ID:
+        print(f"Category ID Filter: {CATEGORY_ID}")
         
     while True:
         token = get_ebay_token()
