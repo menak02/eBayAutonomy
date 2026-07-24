@@ -3,10 +3,11 @@
 A Python background daemon that queries the eBay Browse API for new listings, applies hard filtering thresholds (trust scores, rating history, condition, and search-hijacking protection), and uses OpenCode LLMs (OpenAI-compatible) to evaluate deal quality.
 
 ## Features
+- **Dynamic Category & Filter Generation:** Uses the eBay Taxonomy API to automatically detect the best category for your search query, and prompts the LLM to generate specific negative keywords to filter out accessories/junk *before* hitting the API.
 - **Adaptive LLM Evaluation:** Evaluates listings dynamically to spot scams, mislabeled items, and bait-and-switch attempts. Accessory items (like cases or packaging) are automatically rejected.
 - **Custom Search Logic:** Pass target searches, max prices, and specialized evaluation prompts via command-line arguments.
 - **Continuous Polling:** Runs persistently in the background, checking for new listings every 5 minutes.
-- **Email Alerts:** Automatically emails you a summary when a deal receives a score of 8/10 or higher.
+- **Multi-Channel Alerts:** Supports Discord, Telegram, and Email alerts when a deal receives a score of 8/10 or higher. You can toggle any of these channels in your `.env`.
 
 ## Setup
 1. Clone the repository and navigate into it:
@@ -28,6 +29,16 @@ A Python background daemon that queries the eBay Browse API for new listings, ap
    EBAY_CLIENT_SECRET=your_production_cert_id
    OPENAI_API_KEY=your_opencode_api_key
 
+   # Toggles
+   ENABLE_EMAIL=false
+   ENABLE_DISCORD=true
+   ENABLE_TELEGRAM=false
+
+   # Discord
+   DISCORD_BOT_TOKEN=your_bot_token
+   DISCORD_CHANNEL_ID=your_channel_id
+
+   # Email
    EMAIL_SENDER=your_gmail_address
    EMAIL_PASSWORD=your_gmail_app_password
    EMAIL_RECEIVER=your_receiver_address
@@ -38,6 +49,12 @@ Run the script with your search query, price thresholds, and optional LLM contex
 ```bash
 python ebay_deal_finder.py "M1 MacBook" --max-price 300 --extra-prompt "Deduct points significantly if battery health is poor or cycle counts are high."
 ```
+
+To run it continuously in the background using `nohup`:
+```bash
+nohup python ebay_deal_finder.py "M1 MacBook" --max-price 300 > deal_finder.log 2>&1 &
+```
+
 To run it once and exit instead of loop:
 ```bash
 python ebay_deal_finder.py "M1 MacBook" --max-price 300 --once

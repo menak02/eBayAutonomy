@@ -7,7 +7,7 @@ import smtplib
 from email.mime.text import MIMEText
 from dotenv import load_dotenv
 import openai
-
+import json
 import argparse
 
 # Load environment variables
@@ -64,30 +64,77 @@ def get_ebay_token():
         
     return auth_res.json().get("access_token")
 
-def send_email_alert(subject, body):
-    """Sends an email alert for a found deal."""
-    sender = os.getenv("EMAIL_SENDER")
-    password = os.getenv("EMAIL_PASSWORD")
-    receiver = os.getenv("EMAIL_RECEIVER")
-    
-    if password == "YOUR_GMAIL_APP_PASSWORD" or not password:
-        print(f"\n[ALERT - WOULD EMAIL] {subject}")
-        print(body)
-        print("(Email not sent: Add your Gmail App Password to .env to enable email sending)\n")
-        return
+def send_alerts(subject, body):
+    """Sends alerts via configured channels (Email, Discord, Telegram)."""
+    # Email
+    if os.getenv("ENABLE_EMAIL", "false").lower() == "true":
+        sender = os.getenv("EMAIL_SENDER")
+        password = os.getenv("EMAIL_PASSWORD")
+        receiver = os.getenv("EMAIL_RECEIVER")
         
-    msg = MIMEText(body)
-    msg['Subject'] = subject
-    msg['From'] = sender
-    msg['To'] = receiver
+        if password == "YOUR_GMAIL_APP_PASSWORD" or not password:
+            print(f"\n[ALERT - WOULD EMAIL] {subject}")
+            print("(Email not sent: Add your Gmail App Password to .env to enable email sending)")
+        else:
+            msg = MIMEText(body)
+            msg['Subject'] = subject
+            msg['From'] = sender
+            msg['To'] = receiver
+            try:
+                with smtplib.SMTP_SSL('smtp.gmail.com', 465) as server:
+                    server.login(sender, password)
+                    server.sendmail(sender, receiver, msg.as_string())
+                print(f"Email sent successfully to {receiver}!")
+            except Exception as e:
+                print(f"Failed to send email: {e}")
 
-    try:
-        with smtplib.SMTP_SSL('smtp.gmail.com', 465) as server:
-            server.login(sender, password)
-            server.sendmail(sender, receiver, msg.as_string())
-        print(f"Email sent successfully to {receiver}!")
-    except Exception as e:
-        print(f"Failed to send email: {e}")
+    # Discord
+    if os.getenv("ENABLE_DISCORD", "false").lower() == "true":
+        bot_token = os.getenv("DISCORD_BOT_TOKEN")
+        channel_id = os.getenv("DISCORD_CHANNEL_ID")
+        if bot_token and channel_id:
+            url = f"https://discord.com/api/v10/channels/{channel_id}/messages"
+            headers = {
+                "Authorization": f"Bot {bot_token}",
+                "Content-Type": "application/json"
+            }
+            # Truncate body if it exceeds discord's 2000 char limit
+            content = f"**{subject}**\n\n{body}"
+            if len(content) > 1950:
+                content = content[:1950] + "... (truncated)"
+            data = {"content": content}
+            try:
+                res = requests.post(url, headers=headers, json=data)
+                if res.status_code in (200, 204):
+                    print("Discord alert sent successfully!")
+                else:
+                    print(f"Failed to send Discord alert: {res.text}")
+            except Exception as e:
+                print(f"Failed to send Discord alert: {e}")
+        else:
+            print("Discord enabled but DISCORD_BOT_TOKEN or DISCORD_CHANNEL_ID is missing in .env")
+
+    # Telegram
+    if os.getenv("ENABLE_TELEGRAM", "false").lower() == "true":
+        bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
+        chat_id = os.getenv("TELEGRAM_CHAT_ID")
+        if bot_token and chat_id:
+            url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+            data = {
+                "chat_id": chat_id,
+                "text": f"*{subject}*\n\n{body}",
+                "parse_mode": "Markdown"
+            }
+            try:
+                res = requests.post(url, json=data)
+                if res.status_code == 200:
+                    print("Telegram alert sent successfully!")
+                else:
+                    print(f"Failed to send Telegram alert: {res.text}")
+            except Exception as e:
+                print(f"Failed to send Telegram alert: {e}")
+        else:
+            print("Telegram enabled but TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID is missing in .env")
 
 def evaluate_deal_with_llm(listing_data):
     """Uses OpenCode (via OpenAI package) to evaluate the deal and return a score."""
@@ -137,7 +184,57 @@ def evaluate_deal_with_llm(listing_data):
         print(f"LLM Evaluation failed: {e}")
         return 0, str(e)
 
-def search_ebay_deals(token):
+def get_best_category(token, query):
+    """Uses eBay's Taxonomy API to find the best category ID and name for the query."""
+    url = f"https://api.ebay.com/commerce/taxonomy/v1/category_tree/0/get_category_suggestions?q={requests.utils.quote(query)}"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/json"
+    }
+    try:
+        res = requests.get(url, headers=headers)
+        if res.status_code == 200:
+            suggestions = res.json().get("categorySuggestions", [])
+            if suggestions:
+                best_cat = suggestions[0].get("category", {})
+                return best_cat.get("categoryId"), best_cat.get("categoryName")
+    except Exception as e:
+        print(f"Failed to fetch category suggestions: {e}")
+    return None, None
+
+def generate_negative_keywords(query, category_name):
+    """Uses LLM to dynamically generate negative keywords for the specific product."""
+    prompt = f"""
+    The user is searching eBay for: "{query}".
+    The detected category is: "{category_name}".
+
+    Please provide a list of negative keywords to exclude accessories, parts, packaging, and unrelated junk.
+    For example:
+    - For shoes: ["box", "laces", "sole", "empty"]
+    - For laptops: ["case", "charger", "cover", "box", "sleeve", "parts", "battery", "screen"]
+    - For phones: ["case", "screen protector", "box", "parts", "empty"]
+
+    Return ONLY a valid JSON array of strings, nothing else. Example: ["case", "charger"]
+    """
+    try:
+        response = client.chat.completions.create(
+            model="deepseek-v4-flash-free",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.1
+        )
+        content = response.choices[0].message.content.strip()
+        # Clean up any markdown blocks if the LLM output them
+        if content.startswith("```json"):
+            content = content[7:-3].strip()
+        elif content.startswith("```"):
+            content = content[3:-3].strip()
+        
+        return json.loads(content)
+    except Exception as e:
+        print(f"Failed to generate dynamic filters: {e}")
+        return []
+
+def search_ebay_deals(token, exclusions=None):
     """Searches eBay for new listings matching our criteria."""
     search_headers = {
         "Authorization": f"Bearer {token}",
@@ -150,10 +247,10 @@ def search_ebay_deals(token):
     if MAX_PRICE:
         filters += f",price:[0..{MAX_PRICE}],priceCurrency:USD"
     
-    # Exclude common accessories directly in the query (negative keyword search)
-    exclusions = ["case", "cover", "sleeve", "bag", "box", "charger", "parts", "accessory", "compatible", "protector"]
+    # Use provided exclusions or default empty
+    exclusions = exclusions or []
     exclude_str = " ".join([f"-{word}" for word in exclusions])
-    full_query = f"{SEARCH_QUERY} {exclude_str}"
+    full_query = f"{SEARCH_QUERY} {exclude_str}".strip()
 
     params = {
         "q": full_query,
@@ -242,7 +339,7 @@ def search_ebay_deals(token):
             body += f"URL: {listing_data['url']}\n\n"
             body += f"--- Evaluation ---\n{explanation}"
             
-            send_email_alert(subject, body)
+            send_alerts(subject, body)
         else:
             print(f"Deal score too low ({score}/10). Skipping alert.")
 
@@ -250,17 +347,32 @@ def main():
     print(f"Starting eBay Deal Finder Daemon for '{SEARCH_QUERY}'...")
     if MAX_PRICE:
         print(f"Max Price Filter: ${MAX_PRICE}")
-    if CATEGORY_ID:
-        print(f"Category ID Filter: {CATEGORY_ID}")
         
+    global CATEGORY_ID
     while True:
         token = get_ebay_token()
         if token:
-            search_ebay_deals(token)
+            # 1. Determine dynamic category if not provided
+            category_name = "Unknown"
+            if not CATEGORY_ID:
+                best_id, category_name = get_best_category(token, SEARCH_QUERY)
+                if best_id:
+                    print(f"Dynamic Category Detected: {category_name} (ID: {best_id})")
+                    CATEGORY_ID = best_id
+                else:
+                    print("Could not dynamically determine category.")
+            
+            # 2. Generate dynamic negative keywords
+            print("Generating dynamic negative keywords...")
+            dynamic_exclusions = generate_negative_keywords(SEARCH_QUERY, category_name)
+            print(f"Applying Exclusions: {dynamic_exclusions}")
+            
+            # 3. Search
+            search_ebay_deals(token, exclusions=dynamic_exclusions)
             
         if RUN_ONCE:
             break
-        
+            
         print(f"Sleeping for {POLL_INTERVAL_SECONDS} seconds...")
         time.sleep(POLL_INTERVAL_SECONDS)
 
