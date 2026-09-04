@@ -2,11 +2,23 @@ import os
 import sys
 import time
 import base64
-import requests
 import smtplib
 from email.mime.text import MIMEText
-from dotenv import load_dotenv
-import openai
+try:
+    from dotenv import load_dotenv
+except ModuleNotFoundError:
+    def load_dotenv(*a, **kw):  # fallback if python-dotenv not installed
+        return False
+try:
+    import openai
+except ModuleNotFoundError:
+    print("Missing 'openai' - run with venv: source venv/bin/activate && pip install -r requirements.txt", file=sys.stderr)
+    sys.exit(1)
+try:
+    import requests
+except ModuleNotFoundError:
+    print("Missing 'requests' - run with venv: source venv/bin/activate && pip install -r requirements.txt", file=sys.stderr)
+    sys.exit(1)
 import json
 import re
 import argparse
@@ -15,16 +27,15 @@ import argparse
 load_dotenv()
 
 CLIENT_ID = os.getenv("EBAY_CLIENT_ID")
-CLIENT_ID = os.getenv("EBAY_CLIENT_ID")
 CLIENT_SECRET = os.getenv("EBAY_CLIENT_SECRET")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-LLM_MODEL_NAME = os.getenv("LLM_MODEL_NAME", "gemini-3.5-flash")
+LLM_MODEL_NAME = os.getenv("LLM_MODEL_NAME", "mimo-v2.5-free")
 
 # Set up OpenAI client (OpenCode API key should work seamlessly with the OpenAI package)
-# Using OpenCode's Go gateway API URL
+# Using OpenCode Zen gateway
 client = openai.OpenAI(
     api_key=OPENAI_API_KEY,
-    base_url="https://opencode.ai/zen/go/v1"
+    base_url="https://opencode.ai/zen/v1"
 )
 
 # Parse command line arguments
@@ -43,9 +54,57 @@ EXTRA_PROMPT = args.extra_prompt
 RUN_ONCE = args.once
 
 POLL_INTERVAL_SECONDS = 300  # 5 minutes
+SEEN_FILE = os.path.join(os.path.dirname(__file__), ".seen_items.json")
+SEEN_ITEMS = set()
+TOKEN_CACHE = {"token": None, "expiry": 0}
 
-def get_ebay_token():
-    """Gets an OAuth token from the eBay Sandbox."""
+# Vision-capable models (allowlist, not denylist)
+VISION_MODELS = {"mimo", "gpt-4", "gemini", "claude", "vision"}
+
+def load_seen():
+    global SEEN_ITEMS
+    try:
+        if os.path.exists(SEEN_FILE):
+            with open(SEEN_FILE, "r") as f:
+                SEEN_ITEMS = set(json.load(f))
+    except Exception:
+        SEEN_ITEMS = set()
+
+def save_seen():
+    try:
+        # cap to last 5000 to avoid unbounded growth
+        data = list(SEEN_ITEMS)[-5000:]
+        with open(SEEN_FILE, "w") as f:
+            json.dump(data, f)
+    except Exception as e:
+        print(f"Failed to save seen items: {e}")
+
+def validate_env():
+    missing = []
+    if not CLIENT_ID:
+        missing.append("EBAY_CLIENT_ID")
+    if not CLIENT_SECRET:
+        missing.append("EBAY_CLIENT_SECRET")
+    if not OPENAI_API_KEY:
+        missing.append("OPENAI_API_KEY")
+    if missing:
+        print(f"Missing required env vars: {', '.join(missing)}")
+        sys.exit(1)
+
+def supports_vision(model_name):
+    name = model_name.lower()
+    return any(v in name for v in VISION_MODELS)
+
+def get_ebay_token(force_refresh=False):
+    """Gets an OAuth token from eBay - cached 2h, validates env."""
+    now = time.time()
+    if not force_refresh and TOKEN_CACHE["token"] and now < TOKEN_CACHE["expiry"] - 60:
+        return TOKEN_CACHE["token"]
+
+    if not CLIENT_ID or not CLIENT_SECRET:
+        print("Missing EBAY_CLIENT_ID/SECRET")
+        return None
+
     credentials = f"{CLIENT_ID}:{CLIENT_SECRET}"
     encoded_creds = base64.b64encode(credentials.encode()).decode()
 
@@ -59,13 +118,22 @@ def get_ebay_token():
     }
 
     print("Fetching eBay OAuth token...")
-    auth_res = requests.post("https://api.ebay.com/identity/v1/oauth2/token", headers=headers, data=data)
+    try:
+        auth_res = requests.post("https://api.ebay.com/identity/v1/oauth2/token", headers=headers, data=data, timeout=15)
+    except Exception as e:
+        print(f"Token request failed: {e}")
+        return None
     
     if auth_res.status_code != 200:
         print(f"Failed to get token: {auth_res.text}")
         return None
-        
-    return auth_res.json().get("access_token")
+
+    j = auth_res.json()
+    token = j.get("access_token")
+    expires_in = int(j.get("expires_in", 7200))
+    TOKEN_CACHE["token"] = token
+    TOKEN_CACHE["expiry"] = now + expires_in
+    return token
 
 def send_alerts(subject, body):
     """Sends alerts via configured channels (Email, Discord, Telegram)."""
@@ -117,30 +185,40 @@ def send_alerts(subject, body):
         else:
             print("Discord enabled but DISCORD_BOT_TOKEN or DISCORD_CHANNEL_ID is missing in .env")
 
-    # Telegram
+    # Telegram - use MarkdownV2 with escaping or plain text fallback
     if os.getenv("ENABLE_TELEGRAM", "false").lower() == "true":
         bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
         chat_id = os.getenv("TELEGRAM_CHAT_ID")
         if bot_token and chat_id:
             url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+            # Escape MarkdownV2 special chars or send plain text to avoid 400
+            def escape_md(text):
+                return re.sub(r'([_*\[\]()~`>#+\-=|{}.!])', r'\\\1', text)
+            safe_body = escape_md(body[:3500])
+            safe_subject = escape_md(subject)
             data = {
                 "chat_id": chat_id,
-                "text": f"*{subject}*\n\n{body}",
-                "parse_mode": "Markdown"
+                "text": f"*{safe_subject}*\n\n{safe_body}",
+                "parse_mode": "MarkdownV2"
             }
             try:
-                res = requests.post(url, json=data)
+                res = requests.post(url, json=data, timeout=10)
                 if res.status_code == 200:
                     print("Telegram alert sent successfully!")
                 else:
-                    print(f"Failed to send Telegram alert: {res.text}")
+                    # fallback to plain text
+                    res2 = requests.post(url, json={"chat_id": chat_id, "text": f"{subject}\n\n{body[:3500]}"}, timeout=10)
+                    if res2.status_code == 200:
+                        print("Telegram alert sent (plain text fallback)!")
+                    else:
+                        print(f"Failed to send Telegram alert: {res.text}")
             except Exception as e:
                 print(f"Failed to send Telegram alert: {e}")
         else:
             print("Telegram enabled but TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID is missing in .env")
 
 def evaluate_deal_with_llm(listing_data):
-    """Uses OpenCode (via OpenAI package) to evaluate the deal (multimodal)."""
+    """Uses OpenCode (via OpenAI package) to evaluate the deal (multimodal). Handles 429/FreeUsageLimit."""
     
     # Truncate description to prevent token bloat
     description = listing_data.get('description', '')[:2500]
@@ -172,38 +250,53 @@ def evaluate_deal_with_llm(listing_data):
     # Build multimodal message content
     content_blocks = [{"type": "text", "text": prompt}]
     
-    # Add images if available AND model supports vision (DeepSeek does not)
-    if "deepseek" not in LLM_MODEL_NAME.lower():
+    # Add images if model supports vision (allowlist)
+    if supports_vision(LLM_MODEL_NAME):
         for img_url in listing_data.get("images", []):
             content_blocks.append({
                 "type": "image_url",
                 "image_url": {"url": img_url}
             })
 
-    try:
-        response = client.chat.completions.create(
-            model=LLM_MODEL_NAME,
-            messages=[
-                {"role": "system", "content": "You are an expert deal finder and scam detector for eBay electronics."},
-                {"role": "user", "content": content_blocks}
-            ],
-            temperature=0.3
-        )
-        content = response.choices[0].message.content
-        print(f"\n--- LLM Evaluation ---\n{content}\n----------------------")
-        
-        # Extract the score
-        for line in content.split('\n'):
-            if "FINAL_SCORE:" in line:
-                try:
-                    score = int(line.split("FINAL_SCORE:")[1].strip())
-                    return score, content
-                except ValueError:
-                    pass
-        return 0, content
-    except Exception as e:
-        print(f"LLM Evaluation failed: {e}")
-        return 0, str(e)
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            response = client.chat.completions.create(
+                model=LLM_MODEL_NAME,
+                messages=[
+                    {"role": "system", "content": "You are an expert deal finder and scam detector for eBay electronics."},
+                    {"role": "user", "content": content_blocks}
+                ],
+                temperature=0.3
+            )
+            content = response.choices[0].message.content
+            print(f"\n--- LLM Evaluation ---\n{content}\n----------------------")
+            
+            # Extract the score
+            for line in content.split('\n'):
+                if "FINAL_SCORE:" in line:
+                    try:
+                        score = int(line.split("FINAL_SCORE:")[1].strip())
+                        return score, content
+                    except ValueError:
+                        pass
+            return 0, content
+        except Exception as e:
+            err_str = str(e)
+            # Detect rate-limit / free-tier quota - do NOT return 0 (false negative)
+            is_rate_limit = "429" in err_str or "Rate limit" in err_str or "FreeUsageLimit" in err_str or "rate_limit" in err_str.lower()
+            if is_rate_limit:
+                if attempt < max_retries - 1:
+                    backoff = 5 * (2 ** attempt)  # 5s, 10s, 20s
+                    print(f"LLM rate-limited (attempt {attempt+1}/{max_retries}): {e} - retrying in {backoff}s...")
+                    time.sleep(backoff)
+                    continue
+                print(f"LLM rate-limited after {max_retries} retries: {e}")
+                print(" -> Free tier quota hit. Pausing LLM evals this cycle. Check https://opencode.ai dashboard or wait for reset.")
+                return None, f"RATE_LIMITED: {err_str}"
+            print(f"LLM Evaluation failed: {e}")
+            return 0, err_str
+    return None, "RATE_LIMITED: max retries exceeded"
 
 def get_best_category(token, query):
     """Uses eBay's Taxonomy API to find the best category ID and name for the query."""
@@ -291,23 +384,21 @@ def get_item_details(token, item_id):
         
     return "", []
 
-def search_ebay_deals(token, exclusions=None):
-    """Searches eBay for new listings matching our criteria."""
+def search_ebay_deals(token, effective_category_id=None):
+    """Searches eBay for new listings matching our criteria. Returns count of new alerts."""
     search_headers = {
         "Authorization": f"Bearer {token}",
         "X-EBAY-C-MARKETPLACE-ID": "EBAY_US",
         "Content-Type": "application/json"
     }
 
-    # Combined filters: Buy It Now, Used/New conditions, Top Rated Sellers only
-    filters = "buyingOptions:{FIXED_PRICE},conditions:{USED|NEW},topRatedSellingProgram:true"
+    # Expanded conditions filter; removed topRatedSellingProgram requirement
+    filters = "buyingOptions:{FIXED_PRICE},conditions:{USED|NEW|REFURBISHED}"
     if MAX_PRICE:
         filters += f",price:[0..{MAX_PRICE}],priceCurrency:USD"
     
-    # Use provided exclusions or default empty
-    exclusions = exclusions or []
-    exclude_str = " ".join([f"-{word}" for word in exclusions])
-    full_query = f"{SEARCH_QUERY} {exclude_str}".strip()
+    # Send clean query to eBay to avoid stripping valid bundle listings
+    full_query = SEARCH_QUERY.strip()
 
     params = {
         "q": full_query,
@@ -316,27 +407,41 @@ def search_ebay_deals(token, exclusions=None):
         "limit": "20"
     }
 
-    if CATEGORY_ID:
-        params["category_ids"] = CATEGORY_ID
+    if effective_category_id:
+        params["category_ids"] = effective_category_id
 
-    print(f"Searching eBay Live API for '{SEARCH_QUERY}' (excl. accessories)...")
-    if CATEGORY_ID:
-        print(f"Restricted to Category: {CATEGORY_ID}")
+    print(f"Searching eBay Live API for '{SEARCH_QUERY}'...")
+    if effective_category_id:
+        print(f"Restricted to Category: {effective_category_id}")
         
-    res = requests.get("https://api.ebay.com/buy/browse/v1/item_summary/search", headers=search_headers, params=params)
+    try:
+        res = requests.get("https://api.ebay.com/buy/browse/v1/item_summary/search", headers=search_headers, params=params, timeout=15)
+    except Exception as e:
+        print(f"Browse API request failed: {e}")
+        return 0
     
+    if res.status_code == 429:
+        print("Browse API throttled (429), backing off 60s")
+        time.sleep(60)
+        return 0
     if res.status_code != 200:
         print(f"Error calling Browse API: {res.text}")
-        return
+        return 0
 
     items = res.json().get("itemSummaries", [])
     if not items:
         print("No new items found.")
-        return
+        return 0
 
-    for item in items:
+    new_alerts = 0
+    for idx, item in enumerate(items):
         title = item.get("title", "")
         item_id = item.get("itemId")
+        if not item_id:
+            continue
+        # Dedup: skip seen items (only mark seen after successful eval)
+        if item_id in SEEN_ITEMS:
+            continue
         
         # Extract Price & Shipping
         price = float(item.get("price", {}).get("value", 0))
@@ -361,16 +466,19 @@ def search_ebay_deals(token, exclusions=None):
         
         # Skip For Parts (7000)
         if str(condition_id) == "7000":
+            SEEN_ITEMS.add(item_id)
             continue
             
-        # Hard Trust Filters
-        if feedback_score < 10 or feedback_pct < 95.0:
+        # Hard Trust Filters - relaxed: was <10/<95, now <5/<90 to keep small sellers
+        if feedback_score < 5 or feedback_pct < 90.0:
+            SEEN_ITEMS.add(item_id)
             continue
             
         # Description / Title Traps
         lower_title = title.lower()
         traps = ["box only", "as-is", "untested", "for parts", "read description"]
         if any(trap in lower_title for trap in traps):
+            SEEN_ITEMS.add(item_id)
             continue
             
         # Compile data for LLM (Basic)
@@ -392,6 +500,15 @@ def search_ebay_deals(token, exclusions=None):
         
         print(f"Evaluating: {title} | Total: ${total_cost:.2f}")
         score, explanation = evaluate_deal_with_llm(listing_data)
+
+        # Handle free-tier rate limit: don't mark seen, pause evals
+        if score is None:
+            print(f"Rate limit hit during eval for {item_id} - pausing remaining {len(items)-idx-1} items this cycle. Will retry next poll.")
+            # do NOT add to SEEN_ITEMS, so it retries next cycle
+            break
+
+        # Mark seen only after successful LLM eval
+        SEEN_ITEMS.add(item_id)
         
         if score >= 8:
             print(f"🔥 HOT DEAL ALERT! Score: {score}/10")
@@ -403,35 +520,45 @@ def search_ebay_deals(token, exclusions=None):
             body += f"--- Evaluation ---\n{explanation}"
             
             send_alerts(subject, body)
+            new_alerts += 1
         else:
             print(f"Deal score too low ({score}/10). Skipping alert.")
 
+        # Throttle free tier: 2s gap between LLM calls
+        if idx < len(items) - 1:
+            time.sleep(2)
+
+    save_seen()
+    print(f"Checked {len(items)} items, {new_alerts} new alerts. Seen total: {len(SEEN_ITEMS)}")
+    return new_alerts
+
 def main():
+    validate_env()
+    load_seen()
     print(f"Starting eBay Deal Finder Daemon for '{SEARCH_QUERY}'...")
     if MAX_PRICE:
         print(f"Max Price Filter: ${MAX_PRICE}")
+    if CATEGORY_ID:
+        print(f"Using fixed Category: {CATEGORY_ID}")
         
-    global CATEGORY_ID
     while True:
         token = get_ebay_token()
         if token:
-            # 1. Determine dynamic category if not provided
-            category_name = "Unknown"
-            if not CATEGORY_ID:
+            # Determine effective category without mutating global
+            effective_category_id = CATEGORY_ID
+            if not effective_category_id:
                 best_id, category_name = get_best_category(token, SEARCH_QUERY)
                 if best_id:
                     print(f"Dynamic Category Detected: {category_name} (ID: {best_id})")
-                    CATEGORY_ID = best_id
+                    effective_category_id = best_id
                 else:
-                    print("Could not dynamically determine category.")
+                    print("Could not dynamically determine category, searching without category filter.")
             
-            # 2. Generate dynamic negative keywords
-            print("Generating dynamic negative keywords...")
-            dynamic_exclusions = generate_negative_keywords(SEARCH_QUERY, category_name)
-            print(f"Applying Exclusions: {dynamic_exclusions}")
-            
-            # 3. Search
-            search_ebay_deals(token, exclusions=dynamic_exclusions)
+            # Search - clean query, no negative-keyword over-filtering
+            # LLM filtering happens in evaluate_deal_with_llm step
+            search_ebay_deals(token, effective_category_id=effective_category_id)
+        else:
+            print("Skipping search due to token failure, will retry next poll.")
             
         if RUN_ONCE:
             break

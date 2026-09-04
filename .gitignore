@@ -3,3 +3,4 @@ venv/
 __pycache__/
 *.log
 .system_generated/
+.seen_items.json
